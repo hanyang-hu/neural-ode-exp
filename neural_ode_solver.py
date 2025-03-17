@@ -1,120 +1,124 @@
+import torch
 import numpy as np
-from scipy.integrate import solve_ivp
-import jax.numpy as jnp
-from jax import grad
 from tqdm import tqdm
 
-def flatten_parameters(theta):
-    return jnp.concatenate([param.flatten() for param in theta])
+class MLP(torch.nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, zero_init=False):
+        super(MLP, self).__init__()
+        self.fc1 = torch.nn.Linear(input_size, hidden_size)
+        self.fc2 = torch.nn.Linear(hidden_size, output_size)
 
-def unflatten_parameters(flatten_theta):
-    shapes = [(64, 1), (64,), (1, 64), (1,)]
-    params = []
-    idx = 0
-    for shape in shapes:
-        size = np.prod(shape)
-        params.append(flatten_theta[idx:idx + size].reshape(shape))
-        idx += size
-    return params
+        # Initialize weights
+        if zero_init:
+            torch.nn.init.zeros_(self.fc1.weight)
+            torch.nn.init.zeros_(self.fc1.bias)
+            torch.nn.init.zeros_(self.fc2.weight)
+            torch.nn.init.zeros_(self.fc2.bias)
+        else:
+            torch.nn.init.xavier_uniform_(self.fc1.weight)
+            torch.nn.init.zeros_(self.fc1.bias)
+            torch.nn.init.xavier_uniform_(self.fc2.weight)
+            torch.nn.init.zeros_(self.fc2.bias)
 
-def mlp(t, flatten_theta):
-    theta = unflatten_parameters(flatten_theta)
-    W1, b1, W2, b2 = theta
-    x = jnp.array([t])
-    h = jnp.tanh(W1 @ x + b1)
-    y = W2 @ h + b2
-    return y
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
 
-def dynamics_func(t, y, *args):
-    alpha, theta = args
-    A = jnp.array([[0, 1], [0, -alpha(t)]])
-    B = jnp.array([[0], [1]])
-    u = mlp(t, theta)
-    return A @ y + B @ u
+@torch.no_grad()
+def state_eqn(t, z, u, alpha):
+    A = torch.tensor([[0., 1.], [0., -alpha(t)]])
+    B = torch.tensor([[0.], [1.]])
+    f = A @ z + B @ u
+    return f
 
-def hamiltonian(t, z, p, flatten_theta, *args):
+@torch.no_grad()
+def costate_eqn(t, p, alpha):
+    A = torch.tensor([[0., 1.], [0., -alpha(t)]])
+    return -A.T @ p
+
+def hamiltonian(t, z, p, u, *args):
     L, alpha = args
-    f = dynamics_func(t, z, alpha, flatten_theta)
-    u = mlp(t, flatten_theta)
-    return (p @ f - L * u**2).reshape(())
+    A = torch.tensor([[0., 1.], [0., -alpha(t)]]).requires_grad_(False)
+    B = torch.tensor([[0.], [1.]]).requires_grad_(False)
+    f = A @ z + B @ u
+    H = p @ f - L * u ** 2
+    return H
 
-def backward_augmented_ode(t, y, *args):
-    z, p, _ = jnp.split(y, [2, 4])
-    L, alpha, flatten_theta = args
+def update_w(w, t, z, p, model, L, alpha, h):
+    # clear the gradients
+    model.zero_grad()
 
-    # Compute gradients
-    grad_H_z = grad(hamiltonian, argnums=1)(t, z, p, flatten_theta, L, alpha)
-    grad_H_p = grad(hamiltonian, argnums=2)(t, z, p, flatten_theta, L, alpha)
-    grad_H_theta = grad(hamiltonian, argnums=3)(t, z, p, flatten_theta, L, alpha)
+    # Compute Hamiltonian and backpropagate
+    u = model(torch.tensor([t]))
+    H = -hamiltonian(t, z, p, u, L, alpha) # the goal is to compute -\nabla_\theta H
+    H.backward()
 
-    dz_dt = grad_H_p
-    dp_dt = -grad_H_z
-    dw_dt = grad_H_theta
+    # Update w
+    with torch.no_grad():
+        w.fc1.weight -= h * model.fc1.weight.grad
+        w.fc1.bias -= h * model.fc1.bias.grad
+        w.fc2.weight -= h * model.fc2.weight.grad
+        w.fc2.bias -= h * model.fc2.bias.grad
 
-    return jnp.concatenate([dz_dt, dp_dt, dw_dt])
+    return w
 
-def neural_ode_solver(L, alpha, iterations=10, lr=0.01):
-    # initialize theta parameter
-    input_dim, hidden_dim, output_dim = 1, 64, 1
-    theta = [
-        jnp.zeros((hidden_dim, input_dim)),
-        jnp.zeros(hidden_dim),
-        jnp.zeros((output_dim, hidden_dim)),
-        jnp.zeros(output_dim)
-    ]
-    flatten_theta = flatten_parameters(theta)
 
-    progress_bar = tqdm(range(iterations))
+def neural_ode_solver(L, alpha, num_iters=5000, lr=0.1, decay_rate=0.999):
+    hidden_dim = 64
+    model = MLP(1, hidden_dim, 1)
+
+    progress_bar = tqdm(range(num_iters))
     for _ in progress_bar:
-        # forward pass to compute z(T)
-        t_span = (0.0, 1.0)
-        z_0 = jnp.array([1.0, 0.0])
-        params = (alpha, flatten_theta)
-        solution = solve_ivp(
-            fun=dynamics_func,
-            t_span=t_span,
-            y0=z_0,
-            args=params,
-            method='RK45',
-            dense_output=False,
-            t_eval=[1.0]
-        )
-        z_T = solution.y.flatten()
+        # forward pass to compute z_T
+        with torch.no_grad():
+            t_0, T, h = 0.0, 1.0, 0.01
+            z = torch.tensor([1.0, 0.0])
+            for t in torch.arange(t_0, T, h):
+                u = model(torch.tensor([t]))
+                z = z + h * state_eqn(t, z, u, alpha)
+        z_T = z.detach()
 
-        # backward pass to solve the augmented ODE
-        t_span = (1.0, 0.0)
-        augmented_z_T = jnp.concatenate([z_T, jnp.zeros_like(z_T), jnp.zeros_like(flatten_theta)])
-        params = (L, alpha, flatten_theta)
-        backward_solution = solve_ivp(
-            fun=backward_augmented_ode,
-            t_span=t_span,
-            y0=augmented_z_T,
-            args=params,
-            method='RK45',
-            dense_output=False,
-            t_eval=[0.0]
-        )
-        y_0 = backward_solution.y.flatten()
+        # backward pass to compute w_0
+        M = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
+        augmented_z = {
+            'z': z_T,
+            'p': -2 * M @ z_T,
+            'w': MLP(1, hidden_dim, 1, zero_init=True)
+        }
+        for t in torch.arange(T, t_0, -h):
+            augmented_z.update({
+                'z': augmented_z['z'] - h * state_eqn(t, augmented_z['z'], model(torch.tensor([t])).detach(), alpha),
+                'p': augmented_z['p'] - h * costate_eqn(t, augmented_z['p'], alpha),
+                'w': update_w(augmented_z['w'], t, augmented_z['z'], augmented_z['p'], model, L, alpha, h)
+            })
 
-        flatten_w_0 = y_0[4:]
+        # extract gradient and update model
+        w_0 = augmented_z['w']
+        with torch.no_grad():
+            model.fc1.weight += lr * w_0.fc1.weight
+            model.fc1.bias += lr * w_0.fc1.bias
+            model.fc2.weight += lr * w_0.fc2.weight
+            model.fc2.bias += lr * w_0.fc2.bias
 
-        # update theta
-        flatten_theta = flatten_theta + lr * flatten_w_0
-        theta = unflatten_parameters(flatten_theta)
+            grad_norm = torch.norm(w_0.fc1.weight) + torch.norm(w_0.fc1.bias) + torch.norm(w_0.fc2.weight) + torch.norm(w_0.fc2.bias)
 
-        progress_bar.set_description(f"Grad Norm: {jnp.linalg.norm(flatten_w_0):.6f}")
+        lr *= decay_rate # learning rate decay
 
-    # evaluate the optimal control
-    t_eval = np.linspace(t_span[0], t_span[1], 1000)
-    u = np.array([mlp(t, theta) for t in t_eval])
+        progress_bar.set_description(f"Grad Norm: {grad_norm.item():.4f}")
 
-    return t_eval, u
-
+    # Return t, u
+    t = torch.linspace(0, 1, 100).reshape(-1, 1)
+    u = model(t).detach().numpy()
+    return t.numpy(), u
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
-    # Solve the RDE
-    t, u = neural_ode_solver(100, lambda t : 0)
+    # Set random seed
+    torch.manual_seed(0)
+
+    # Solve the Neural ODE
+    t, u = neural_ode_solver(1/3, lambda t : np.sin(t))
     
     # Plot the solution
     plt.plot(t, u)
@@ -122,9 +126,3 @@ if __name__ == "__main__":
     plt.ylabel("Control")
     plt.title("Neural ODE Solution")
     plt.show()
-
-
-
-
-
-    

@@ -92,7 +92,7 @@ def rde_solver(L, alpha):
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     # Solve the RDE
-    t, u = rde_solver(100, lambda t : 10)
+    t, u = rde_solver(1/3, lambda t : np.sin(t))
     
     # Plot the solution
     plt.plot(t, u)
