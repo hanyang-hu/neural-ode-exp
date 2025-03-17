@@ -20,7 +20,7 @@ class MLP(torch.nn.Module):
             torch.nn.init.xavier_uniform_(self.fc2.weight)
             torch.nn.init.zeros_(self.fc2.bias)
 
-        self.act_fn = torch.nn.ELU()
+        self.act_fn = torch.nn.Tanh()
 
     def forward(self, x):
         x = self.act_fn(self.fc1(x))
@@ -41,15 +41,15 @@ def costate_eqn(t, p, alpha):
 
 def hamiltonian(t, z, p, u, *args):
     L, alpha = args
-    A = torch.tensor([[0., 1.], [0., -alpha(t)]]).requires_grad_(False)
-    B = torch.tensor([[0.], [1.]]).requires_grad_(False)
+    A = torch.tensor([[0., 1.], [0., -alpha(t)]])
+    B = torch.tensor([[0.], [1.]])
     f = A @ z + B @ u
     H = p @ f - L * u ** 2
     return H
 
 def update_w(w, t, z, p, model, L, alpha, h):
     # clear the gradients
-    model.zero_grad()
+    model.zero_grad(set_to_none=True)
 
     # Compute Hamiltonian and backpropagate
     u = model(torch.tensor([t]))
@@ -76,8 +76,8 @@ class PD():
         return control
     
 
-def neural_ode_solver(L, alpha, num_iters=1000, lr=0.1, decay_rate=0.999, pd_init=True, pd_train_iters=3000):
-    hidden_dim = 64
+def neural_ode_solver(L, alpha, num_iters=500, lr=0.05, decay_rate=0.999, time_iterval=0.05, pd_init=False, rde_init=True, pre_train_iters=5000):
+    hidden_dim = 10
     model = MLP(1, hidden_dim, 1)
 
     if pd_init:
@@ -108,11 +108,38 @@ def neural_ode_solver(L, alpha, num_iters=1000, lr=0.1, decay_rate=0.999, pd_ini
 
             progress_bar.set_postfix({'Loss': loss.item()})
 
+    elif rde_init:
+        # Use RDE solution as initial guess
+        from rde_solver import rde_solver
+        t_rde, u_rde = rde_solver(L, alpha)
+        t, u = torch.tensor(t_rde).reshape(-1, 1).float(), torch.tensor(u_rde).reshape(-1, 1).float()
+
+        # Fit a neural network to the control trajectory
+        progress_bar = tqdm(range(pre_train_iters), desc="Fitting RDE Solution")
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+        for _ in progress_bar:
+            optimizer.zero_grad()
+
+            loss = torch.mean((model(t) - u) ** 2)
+
+            loss.backward()
+            optimizer.step()
+
+            progress_bar.set_postfix({'Loss': loss.item()})
+
+    # add random noise to the model parameters
+    with torch.no_grad():
+        sigma = 0.05
+        model.fc1.weight += sigma * torch.randn_like(model.fc1.weight)
+        model.fc1.bias += sigma * torch.randn_like(model.fc1.bias)
+        model.fc2.weight += sigma * torch.randn_like(model.fc2.weight)
+        model.fc2.bias += sigma * torch.randn_like(model.fc2.bias)
+
     progress_bar = tqdm(range(num_iters), desc="Training Neural ODE")
     for _ in progress_bar:
         # forward pass to compute z_T
         with torch.no_grad():
-            t_0, T, h = 0.0, 1.0, 0.01
+            t_0, T, h = 0.0, 1.0, time_iterval
             z = torch.tensor([1.0, 0.0])
             for t in torch.arange(t_0, T, h):
                 u = model(torch.tensor([t]))
@@ -127,10 +154,13 @@ def neural_ode_solver(L, alpha, num_iters=1000, lr=0.1, decay_rate=0.999, pd_ini
             'w': MLP(1, hidden_dim, 1, zero_init=True)
         }
         for t in torch.arange(T, t_0, -h):
+            new_z = augmented_z['z'] - h * state_eqn(t, augmented_z['z'], model(torch.tensor([t])).detach(), alpha)
+            new_p = augmented_z['p'] - h * costate_eqn(t, augmented_z['p'], alpha)
+            new_w = update_w(augmented_z['w'], t, augmented_z['z'], augmented_z['p'], model, L, alpha, h)
             augmented_z.update({
-                'z': augmented_z['z'] - h * state_eqn(t, augmented_z['z'], model(torch.tensor([t])).detach(), alpha),
-                'p': augmented_z['p'] - h * costate_eqn(t, augmented_z['p'], alpha),
-                'w': update_w(augmented_z['w'], t, augmented_z['z'], augmented_z['p'], model, L, alpha, h)
+                'z': new_z,
+                'p': new_p,
+                'w': new_w
             })
 
         # extract gradient and update model
@@ -146,6 +176,12 @@ def neural_ode_solver(L, alpha, num_iters=1000, lr=0.1, decay_rate=0.999, pd_ini
         lr *= decay_rate # learning rate decay
 
         progress_bar.set_postfix({'Grad Norm': grad_norm.item()})
+
+        # # early stopping
+        # if grad_norm < 1e-3:
+        #     lr = 0.1
+        # else:
+        #     lr = 0.05
 
     # Return t, u
     t = torch.linspace(0, 1, 100).reshape(-1, 1)
