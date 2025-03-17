@@ -76,7 +76,9 @@ class PD():
         return control
     
 
-def neural_ode_solver(L, alpha, num_iters=500, lr=0.05, decay_rate=0.999, time_iterval=0.05, pd_init=False, rde_init=True, pre_train_iters=5000):
+def neural_ode_solver(
+        L, alpha, num_iters=500, lr=0.05, decay_rate=0.999, time_iterval=0.05, 
+        pd_init=False, rde_init=True, pre_train_iters=5000, return_init=False):
     hidden_dim = 10
     model = MLP(1, hidden_dim, 1)
 
@@ -129,11 +131,15 @@ def neural_ode_solver(L, alpha, num_iters=500, lr=0.05, decay_rate=0.999, time_i
 
     # add random noise to the model parameters
     with torch.no_grad():
-        sigma = 0.05
+        sigma = 0.1
         model.fc1.weight += sigma * torch.randn_like(model.fc1.weight)
         model.fc1.bias += sigma * torch.randn_like(model.fc1.bias)
         model.fc2.weight += sigma * torch.randn_like(model.fc2.weight)
         model.fc2.bias += sigma * torch.randn_like(model.fc2.bias)
+
+    if return_init:
+        t = torch.linspace(0, 1, 100).reshape(-1, 1)
+        u_init = model(t).detach().numpy()
 
     progress_bar = tqdm(range(num_iters), desc="Training Neural ODE")
     for _ in progress_bar:
@@ -177,16 +183,14 @@ def neural_ode_solver(L, alpha, num_iters=500, lr=0.05, decay_rate=0.999, time_i
 
         progress_bar.set_postfix({'Grad Norm': grad_norm.item()})
 
-        # # early stopping
-        # if grad_norm < 1e-3:
-        #     lr = 0.1
-        # else:
-        #     lr = 0.05
-
     # Return t, u
     t = torch.linspace(0, 1, 100).reshape(-1, 1)
     u = model(t).detach().numpy()
-    return t.numpy(), u
+    
+    if return_init:
+        return t.numpy(), u, u_init
+    else:
+        return t.numpy(), u
 
 
 if __name__ == "__main__":
