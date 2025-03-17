@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.integrate import solve_ivp
 
-def RDE_solution(L, alpha):
+def rde_solver(L, alpha):
     """
     Compute the solution of the LQR problem using the RDE.
     Args:
@@ -92,7 +92,7 @@ def RDE_solution(L, alpha):
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     # Solve the RDE
-    t, u = RDE_solution(1/3, lambda t : 10)
+    t, u = rde_solver(100, lambda t : 10)
     
     # Plot the solution
     plt.plot(t, u)
