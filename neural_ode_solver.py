@@ -20,8 +20,10 @@ class MLP(torch.nn.Module):
             torch.nn.init.xavier_uniform_(self.fc2.weight)
             torch.nn.init.zeros_(self.fc2.bias)
 
+        self.act_fn = torch.nn.ELU()
+
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
+        x = self.act_fn(self.fc1(x))
         x = self.fc2(x)
         return x
 
@@ -64,11 +66,49 @@ def update_w(w, t, z, p, model, L, alpha, h):
     return w
 
 
-def neural_ode_solver(L, alpha, num_iters=5000, lr=0.1, decay_rate=0.999):
+class PD():
+    def __init__(self, Kp=2.0, Kd=0.1):
+        self.Kp = Kp
+        self.Kd = Kd
+
+    def __call__(self, error, error_dot):
+        control = self.Kp * error + self.Kd * error_dot
+        return control
+    
+
+def neural_ode_solver(L, alpha, num_iters=1000, lr=0.1, decay_rate=0.999, pd_init=True, pd_train_iters=3000):
     hidden_dim = 64
     model = MLP(1, hidden_dim, 1)
 
-    progress_bar = tqdm(range(num_iters))
+    if pd_init:
+        # Use PID controller as initial guess, collect control trajectory after simulation
+        t_0, T, h = 0.0, 1.0, 0.01
+        z = torch.tensor([1.0, 0.0])
+        pid_controller = PD()
+        data_t, data_u = [], []
+        for t in torch.arange(t_0, T, h):
+            error = -z[0].item() # goal is to minimize x^2
+            error_dot = -z[1].item()
+            u = pid_controller(error, error_dot)
+            z = z + h * state_eqn(t, z, torch.tensor([u]), alpha)
+            data_t.append(t)
+            data_u.append(u)
+
+        # Fit a neural network to the control trajectory
+        progress_bar = tqdm(range(pd_train_iters), desc="Fitting PID Controller")
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+        t, u = torch.tensor(data_t).reshape(-1, 1), torch.tensor(data_u).reshape(-1, 1)
+        for _ in progress_bar:
+            optimizer.zero_grad()
+
+            loss = torch.mean((model(t) - u) ** 2)
+
+            loss.backward()
+            optimizer.step()
+
+            progress_bar.set_postfix({'Loss': loss.item()})
+
+    progress_bar = tqdm(range(num_iters), desc="Training Neural ODE")
     for _ in progress_bar:
         # forward pass to compute z_T
         with torch.no_grad():
@@ -105,12 +145,13 @@ def neural_ode_solver(L, alpha, num_iters=5000, lr=0.1, decay_rate=0.999):
 
         lr *= decay_rate # learning rate decay
 
-        progress_bar.set_description(f"Grad Norm: {grad_norm.item():.4f}")
+        progress_bar.set_postfix({'Grad Norm': grad_norm.item()})
 
     # Return t, u
     t = torch.linspace(0, 1, 100).reshape(-1, 1)
     u = model(t).detach().numpy()
     return t.numpy(), u
+
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
@@ -118,7 +159,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
 
     # Solve the Neural ODE
-    t, u = neural_ode_solver(1/3, lambda t : np.sin(t))
+    t, u = neural_ode_solver(1/3, lambda t : np.sin(t), pd_init=False)
     
     # Plot the solution
     plt.plot(t, u)
