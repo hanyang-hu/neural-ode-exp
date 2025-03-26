@@ -78,7 +78,7 @@ class PD():
 
 def neural_ode_solver(
         L, alpha, num_iters=500, lr=0.05, decay_rate=0.999, time_iterval=0.05, 
-        pd_init=False, rde_init=True, pre_train_iters=5000, return_init=False):
+        pd_init=False, rde_init=True, pre_train_iters=3000, return_init=False):
     hidden_dim = 10
     model = MLP(1, hidden_dim, 1)
 
