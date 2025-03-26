@@ -138,7 +138,7 @@ def neural_ode_solver(
         model.fc2.bias += sigma * torch.randn_like(model.fc2.bias)
 
     if return_init:
-        t = torch.linspace(0, 1, 100).reshape(-1, 1)
+        t = torch.linspace(0, 1, 1000).reshape(-1, 1)
         u_init = model(t).detach().numpy()
 
     progress_bar = tqdm(range(num_iters), desc="Training Neural ODE")
@@ -184,7 +184,7 @@ def neural_ode_solver(
         progress_bar.set_postfix({'Grad Norm': grad_norm.item()})
 
     # Return t, u
-    t = torch.linspace(0, 1, 100).reshape(-1, 1)
+    t = torch.linspace(0, 1, 1000).reshape(-1, 1)
     u = model(t).detach().numpy()
     
     if return_init:
